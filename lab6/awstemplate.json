@@ -1,0 +1,586 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+##############################################
+Parameters:
+##############################################
+  KeyName:
+    Type: String
+    Description: Keyname for the keypair that Qwiklab will use
+    Default: lab-key-pair
+
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2
+
+  RoleName:
+    Description: Enter the service linked role name.
+    Type: String
+    Default: AWSServiceRoleForAutoScaling
+
+  ServiceName:
+    Description: Choose a service to create a service linked role.
+    Type: String
+    Default: autoscaling.amazonaws.com
+
+##############################################
+Resources:
+##############################################
+
+  LambdaSLRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: createservicerole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                  - iam:UpdateServiceLinkedRole
+                  - iam:DeleteServiceLinkedRole
+                  - iam:AttachRolePolicy
+                  - iam:ListRoles
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                Resource: '*'
+  
+  CreateServiceLinkedRole:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - LambdaSLRRole
+    Properties: 
+      FunctionName: CreateServiceLinkedRole
+      Description: Create a service linked role if absent. 
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaSLRRole.Arn
+      Runtime: "python3.7"
+      Timeout: 50
+      Code:
+        ZipFile: |
+          """
+          This application creates a service
+          linked role if it is missing.
+          """
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+          import traceback
+
+          # Define logging information
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info(f"Event: {json.dumps(event)}")
+              logger.info(f"Context: {str(dir(context))}")
+              operation = event['RequestType']
+              physical_id = None
+              data = { }
+              try:
+                  role_check = event['ResourceProperties']['CheckRoleName']
+                  aws_service_info = event['ResourceProperties']['AWSServiceInfo']
+                  if operation == 'Create':  
+                      client = boto3.client('iam')
+                      response = client.list_roles(PathPrefix='/aws-service-role/')
+                      role_names = list()
+                      for roles in response["Roles"]:
+                          role_names.append(roles["RoleName"])
+                      if role_check not in role_names:
+                          logger.info(f"Creating service linked role {role_check}...")
+                          create_role_response = client.create_service_linked_role(
+                              AWSServiceName=aws_service_info,
+                              Description='Custom service linked role created for the lab.',
+                              #CustomSuffix='lab'
+                          )
+                          logger.info(f"Details for create service linked role: {create_role_response}")
+                          data['ServiceLinkedRoleOutput'] = create_role_response['Role']['RoleName']
+                      else:
+                          logger.info(f"Service linked role {role_check} already present.")
+                          data['ServiceLinkedRoleOutput'] = 'Service linked role already present.'
+
+              except Exception as excep:
+                  logger.error(f"CloudFormation custom resource {operation} failed. Exception: {traceback.format_exc()}")
+                  data['ServiceLinkedRoleOutput'] = None
+                  status = cfnresponse.FAILED
+              else:
+                  status = cfnresponse.SUCCESS
+                  logger.info(f"CloudFormation custom resource {operation} succeeded. Result data {json.dumps(data)}.")
+              cfnresponse.send(event, context, status, data, physical_id)
+
+
+  ServiceLinkedRoleCustomResource:
+    Type: Custom::ServiceLinkedRoleCustomResource
+    DependsOn:
+      - CreateServiceLinkedRole
+    Properties:
+      ServiceToken: !GetAtt CreateServiceLinkedRole.Arn
+      CheckRoleName: !Ref RoleName
+      AWSServiceInfo: !Ref ServiceName
+    
+  
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Public Subnet 2
+
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Private Subnet 1
+
+  PrivateSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Private Subnet 2
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private Route Table
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  WebInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref AmazonLinuxAMIID
+      KeyName: !Ref KeyName
+      InstanceType: t2.micro
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: 'true'
+          SubnetId: !Ref PublicSubnet1
+          GroupSet:
+            - !Ref WebSecurityGroup
+      SourceDestCheck: 'false'
+      Tags:
+        - Key: Name
+          Value: Web Server 1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          # Uses Amazon Linux 1 due to PHP incompatibilities
+          yum -y update
+          yum -y install httpd php mysql php-mysql
+          chkconfig httpd on
+          /etc/init.d/httpd start
+          cd /var/www/html
+          wget https://aws-tc-largeobjects.s3.amazonaws.com/AWS-TC-AcademyACF/acf-lab5-vpc/lab-app.zip
+          unzip lab-app.zip -d /var/www/html/
+          chown apache:root /var/www/html/rds.conf.php
+
+  WebSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP access
+      GroupName: Web Security Group
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Web Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+
+  # NAT Gateway
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      AllocationId: !GetAtt
+        - NATGatewayEIP
+        - AllocationId
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGatewayRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NATGateway
+
+  DBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: DB Security Group
+      GroupName: DB Security Group
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: DB Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '3306'
+          ToPort: '3306'
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+
+  DBsubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: Lab DB Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  IAMUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: awsstudent
+
+  IAMPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    DependsOn: IAMUser
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: [{
+            "Sid": "Lab3",
+            "Action": [
+                "autoscaling:AttachInstances",
+                "autoscaling:*AutoScalingGroup",
+                "autoscaling:Describe*",
+                "autoscaling:DetachInstances",
+                "autoscaling:*Tags",
+                "autoscaling:*Configuration",
+                "autoscaling:*Hook",
+                "autoscaling:*Lifecycle*",
+                "autoscaling:*LoadBalancer*",
+                "autoscaling:*Metrics*",
+                "autoscaling:*Policy",
+                "autoscaling:*Processes",
+                "autoscaling:*Standby",
+                "autoscaling:*Scheduled*",
+                "autoscaling:SetInstanceHealth",
+                "autoscaling:SetDesiredCapacity",
+                "autoscaling:SetInstanceProtection",
+                "cloudformation:List*",
+                "cloudformation:Describe*",
+                "cloudformation:Detect*",
+                "cloudformation:Estimate*",
+                "cloudformation:Get*",
+                "config:Describe*",
+                "elasticloadbalancing:*",
+                "cloudwatch:Describe*",
+                "cloudwatch:Get*",
+                "cloudwatch:List*",
+                "cloudtrail:GetTrailStatus",
+                "cloudtrail:DescribeTrails",
+                "cloudtrail:LookupEvents",
+                "cloudtrail:ListTags",
+                "cloudtrail:ListPublicKeys",
+                "cloudtrail:GetEventSelectors",
+                "iam:Get*",
+                "iam:List*",
+                "sns:*",
+                "ec2:*Address*",
+                "ec2:Cancel*",
+                "ec2:Describe*",
+                "ec2:*Gateway",
+                "ec2:Get*",
+                "ec2:*Image*",
+                "ec2:*Network*",
+                "ec2:*Route*",
+                "ec2:*SecurityGroup*",
+                "ec2:*Snapshot*",
+                "ec2:*Subnet*",
+                "ec2:*Vpc*",
+                "ec2:*Vpn*",
+                "ec2:DeleteFleets",
+                "ec2:ResetEbsDefaultKmsKeyId",
+                "ec2:ReportInstanceStatus",
+                "ec2:ImportKeyPair",
+                "ec2:StopInstances",
+                "ec2:ProvisionByoipCidr",
+                "ec2:WithdrawByoipCidr",
+                "ec2:AssociateDhcpOptions",
+                "ec2:ConfirmProductInstance",
+                "ec2:ConfirmProductInstance",
+                "ec2:ModifyFpgaImageAttribute",
+                "ec2:EnableEbsEncryptionByDefault",
+                "ec2:SendDiagnosticInterrupt",
+                "ec2:AssociateIamInstanceProfile",
+                "ec2:ReplaceIamInstanceProfileAssociation",
+                "ec2:CreateDhcpOptions",
+                "ec2:DeleteDhcpOptions",
+                "ec2:CreateKeyPair",
+                "ec2:DeleteKeyPair",
+                "ec2:BundleInstance",
+                "ec2:CreateTags",
+                "ec2:DisassociateIamInstanceProfile",
+                "ec2:AttachVolume",
+                "ec2:CreateInstanceExportTask",
+                "ec2:MonitorInstances",
+                "ec2:UnmonitorInstances",
+                "ec2:DetachVolume",
+                "ec2:DeleteVolume",
+                "ec2:DeleteLaunchTemplate*",
+                "ec2:CreateFlowLogs",
+                "ec2:DeleteFlowLogs",
+                "ec2:ModifyIdentityIdFormat",
+                "ec2:ModifyIdFormat",
+                "ec2:AdvertiseByoipCidr",
+                "ec2:DeprovisionByoipCidr",
+                "ec2:DeleteTags",
+                "ec2:TerminateInstances",
+                "ec2:DisableEbsEncryptionByDefault",
+                "ec2:ModifyEbsDefaultKmsKeyId",
+                "resource-groups:Get*",
+                "resource-groups:List*",
+                "resource-groups:SearchResources",
+                "s3:ListAllMyBuckets",
+                "s3:GetObject",
+                "s3:GetBucketLocation",
+                "kms:ListAliases",
+                "lambda:ListFunctions"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        },
+        {
+            "Sid": "RestrictInstanceActions",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateVolume",
+                "ec2:ModifyVolume",
+                "ec2:ImportVolume",
+                "ec2:ModifyVolumeAttribute",
+                "ec2:ModifyFleet",
+                "ec2:ImportSnapshot",
+                "ec2:ResetInstanceAttribute",
+                "ec2:CreateFleet",
+                "ec2:CreateLaunchTemplateVersion",
+                "ec2:EnableVolumeIO",
+                "ec2:CreateLaunchTemplate",
+                "ec2:ImportInstance",
+                "ec2:ModifyInstanceCreditSpecification",
+                "ec2:ModifyLaunchTemplate",
+                "ec2:ModifyInstanceAttribute",
+                "ec2:RebootInstances",
+                "ec2:RunInstances",
+                "ec2:StartInstances"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEqualsIfExists": {
+                    "ec2:Owner": "amazon"
+                },
+                "ForAllValues:StringLikeIfExists": {
+                    "ec2:InstanceType": [
+                        "*.nano",
+                        "*.micro",
+                        "*.small"
+                    ],
+                    "ec2:Tenancy": "default"
+                },
+                "StringNotEqualsIfExists": {
+                    "ec2:PlacementGroupStrategy": "cluster"
+                },
+                "StringNotEqualsIgnoreCaseIfExists": {
+                    "ec2:VolumeType": [
+                        "io1",
+                        "st1"
+                    ]
+                },
+                "NumericLessThanEqualsIfExists": {
+                    "ec2:VolumeSize": "35"
+                }
+            }
+        },
+        {
+            "Sid": "RestrictSpotandRI",
+            "Effect": "Deny",
+            "Action": [
+                "ec2:*Spot*",
+                "ec2:*ReservedInstances*",
+                "ec2:*Scheduled*",
+                "ec2:*Purchase*"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "RestrictASLCInstanceType",
+            "Effect": "Allow",
+            "Action": "autoscaling:CreateLaunchConfiguration",
+            "Resource": "*",
+            "Condition": {
+                "ForAnyValue:StringNotLikeIfExists": {
+                    "autoscaling:InstanceType": [
+                        "*.nano",
+                        "*.micro",
+                        "*.small"
+                    ]
+                }
+            }
+        },
+        {
+            "Sid": "RestrictASGInstanceTypeAndNo",
+            "Effect": "Allow",
+            "Action": [
+                "autoscaling:UpdateAutoScalingGroup",
+                "autoscaling:CreateAutoScalingGroup"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "NumericGreaterThanIfExists": {
+                    "autoscaling:MaxSize": "5"
+                },
+                "ForAnyValue:StringNotLikeIfExists": {
+                    "autoscaling:InstanceTypes": [
+                        "*.nano",
+                        "*.micro",
+                        "*.small"
+                    ]
+                }
+            }
+        }]
+      ManagedPolicyName: lab_policy
+      Users:
+        - awsstudent
+  IAMUserAccessKey:
+    Type: 'AWS::IAM::AccessKey'
+    DependsOn: IAMUser
+    Properties:
+      Status: Active
+      UserName: awsstudent
+
+##############################################
+Outputs:
+##############################################
+  WebServer:
+    Value: !GetAtt
+      - WebInstance
+      - PublicIp
+    Description: Public IP address of Web Server
+
+  AccessKey:
+    Value:
+      Ref: IAMUserAccessKey
+  SecretKey:
+    Value:
+      'Fn::GetAtt':
+        - IAMUserAccessKey
+        - SecretAccessKey
